@@ -17,6 +17,7 @@ use super::{
     lead_worker::LeadWorkerProvider,
     litellm::LiteLLMProvider,
     local_inference::LocalInferenceProvider,
+    mlx::MlxProvider,
     ollama::OllamaProvider,
     openai::OpenAiProvider,
     openrouter::OpenRouterProvider,
@@ -49,6 +50,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         registry.register::<AzureProvider>(false);
         registry.register::<BedrockProvider>(false);
         registry.register::<LocalInferenceProvider>(false);
+        registry.register::<MlxProvider>(false);
         registry.register::<ChatGptCodexProvider>(true);
         registry.register::<ClaudeCodeProvider>(true);
         registry.register::<CodexProvider>(true);
