@@ -2,7 +2,6 @@ use anyhow::Result;
 use dotenvy::dotenv;
 use futures::StreamExt;
 use goose::agents::extension_manager::ExtensionManagerCapabilities;
-use goose::agents::platform_extensions::developer::edit::LocalFs;
 use goose::agents::{
     Agent, AgentConfig, AgentEvent, ExtensionManager, GoosePlatform, PromptManager, SessionConfig,
 };
@@ -433,7 +432,6 @@ impl ProviderTester {
         let agent = Agent::with_config(AgentConfig::new(
             session_manager.clone(),
             permission_manager,
-            Arc::new(LocalFs),
             None,
             GooseMode::Approve,
             true,
@@ -610,7 +608,6 @@ async fn test_provider(
     let extension_manager = Arc::new(ExtensionManager::new(
         shared_provider,
         session_manager,
-        Arc::new(LocalFs),
         GoosePlatform::GooseCli.to_string(),
         ExtensionManagerCapabilities { mcpui: false },
     ));

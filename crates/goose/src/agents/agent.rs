@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use super::container::Container;
 use super::final_output_tool::FinalOutputTool;
-use super::platform_extensions::developer::edit::{Fs, LocalFs};
 use super::platform_tools;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::action_required_manager::ActionRequiredManager;
@@ -107,7 +106,6 @@ impl fmt::Display for GoosePlatform {
 pub struct AgentConfig {
     pub session_manager: Arc<SessionManager>,
     pub permission_manager: Arc<PermissionManager>,
-    pub fs: Arc<dyn Fs>,
     pub scheduler_service: Option<Arc<dyn SchedulerTrait>>,
     pub goose_mode: GooseMode,
     pub disable_session_naming: bool,
@@ -118,7 +116,6 @@ impl AgentConfig {
     pub fn new(
         session_manager: Arc<SessionManager>,
         permission_manager: Arc<PermissionManager>,
-        fs: Arc<dyn Fs>,
         scheduler_service: Option<Arc<dyn SchedulerTrait>>,
         goose_mode: GooseMode,
         disable_session_naming: bool,
@@ -127,7 +124,6 @@ impl AgentConfig {
         Self {
             session_manager,
             permission_manager,
-            fs,
             scheduler_service,
             goose_mode,
             disable_session_naming,
@@ -210,7 +206,6 @@ impl Agent {
         Self::with_config(AgentConfig::new(
             Arc::new(SessionManager::instance()),
             PermissionManager::instance(),
-            Arc::new(LocalFs),
             None,
             Config::global().get_goose_mode().unwrap_or(GooseMode::Auto),
             Config::global()
@@ -221,6 +216,7 @@ impl Agent {
     }
 
     pub fn with_config(config: AgentConfig) -> Self {
+        // Create channels with buffer size 32 (adjust if needed)
         let (confirm_tx, confirm_rx) = mpsc::channel(32);
         let (tool_tx, tool_rx) = mpsc::channel(32);
         let provider = Arc::new(Mutex::new(None));
@@ -231,7 +227,6 @@ impl Agent {
             GoosePlatform::GooseCli => ExtensionManagerCapabilities { mcpui: false },
         };
         let session_manager = Arc::clone(&config.session_manager);
-        let fs = Arc::clone(&config.fs);
         let permission_manager = Arc::clone(&config.permission_manager);
         Self {
             provider: provider.clone(),
@@ -239,7 +234,6 @@ impl Agent {
             extension_manager: Arc::new(ExtensionManager::new(
                 provider.clone(),
                 session_manager,
-                fs,
                 goose_platform.to_string(),
                 capabilities,
             )),
