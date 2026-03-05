@@ -1,0 +1,244 @@
+#!/bin/bash
+# mlx — manage the vllm-mlx server for Goose
+#
+# Usage:
+#   mlx <profile>         Start server with profile (kills existing)
+#   mlx swap <profile>    Same as above (explicit restart)
+#   mlx status            Show what's running
+#   mlx stop              Stop the server
+#   mlx log               Tail the server log
+#   mlx profiles          List available profiles
+#
+# Profiles:
+#   27b, 27b-nothink, 35b, 35b-nothink, 35b-8bit, 35b-8bit-nothink
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" && pwd)"
+VENV="$SCRIPT_DIR/vllm-mlx-env"
+PORT=5757
+LOG="/tmp/vllm-mlx-server.log"
+PIDFILE="/tmp/vllm-mlx-server.pid"
+STATEFILE="/tmp/vllm-mlx-server.state"
+MODEL_BASE="$HOME/.cache/lm-studio/models/mlx-community"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+_is_running() {
+  [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+_stop() {
+  if _is_running; then
+    local pid
+    pid=$(cat "$PIDFILE")
+    echo "Stopping vllm-mlx server (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
+    # Wait for clean shutdown (up to 5s)
+    for _ in $(seq 1 10); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    # Force kill if still alive
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  fi
+  # Also catch any orphaned vllm-mlx processes
+  if pgrep -f "vllm-mlx serve" > /dev/null 2>&1; then
+    pkill -f "vllm-mlx serve" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$PIDFILE" "$STATEFILE"
+}
+
+_wait_for_ready() {
+  local max_wait=120
+  local elapsed=0
+  echo -n "Waiting for server..."
+  while (( elapsed < max_wait )); do
+    if curl -s "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
+      echo " ready! (${elapsed}s)"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+    echo -n "."
+  done
+  echo " timed out after ${max_wait}s"
+  echo "Check log: $LOG"
+  return 1
+}
+
+_resolve_profile() {
+  local profile="$1"
+  local model="" label="" thinking="on" reasoning_parser="qwen3"
+
+  # Strip -nothink suffix
+  local base="$profile"
+  if [[ "$profile" == *-nothink ]]; then
+    thinking="off"
+    reasoning_parser=""
+    base="${profile%-nothink}"
+  fi
+
+  case "$base" in
+    27b)
+      model="$MODEL_BASE/Qwen3.5-27B-4bit"
+      label="Qwen 3.5 27B dense 4-bit"
+      ;;
+    35b)
+      model="$MODEL_BASE/Qwen3.5-35B-A3B-4bit"
+      label="Qwen 3.5 35B-A3B 4-bit"
+      ;;
+    35b-8bit)
+      model="$MODEL_BASE/Qwen3.5-35B-A3B-8bit"
+      label="Qwen 3.5 35B-A3B 8-bit"
+      ;;
+    *)
+      echo "Unknown profile: $profile"
+      echo "Run 'mlx profiles' for options."
+      exit 1
+      ;;
+  esac
+
+  echo "$model|$label|$thinking|$reasoning_parser"
+}
+
+_start() {
+  local profile="$1"
+  local resolved
+  resolved=$(_resolve_profile "$profile")
+
+  local model label thinking reasoning_parser
+  IFS='|' read -r model label thinking reasoning_parser <<< "$resolved"
+
+  _stop
+
+  echo "Starting: $label (thinking: $thinking)"
+
+  # Build server args
+  local args=(
+    serve "$model"
+    --enable-auto-tool-choice
+    --tool-call-parser qwen
+    --port "$PORT"
+  )
+  if [[ -n "$reasoning_parser" ]]; then
+    args+=(--reasoning-parser "$reasoning_parser")
+  fi
+
+  # Set thinking env var for our simple.py patch
+  local think_env="1"
+  [[ "$thinking" == "off" ]] && think_env="0"
+
+  # Start backgrounded
+  VLLM_MLX_ENABLE_THINKING="$think_env" \
+    nohup "$VENV/bin/vllm-mlx" "${args[@]}" \
+    > "$LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
+
+  # Save state for status command
+  cat > "$STATEFILE" <<EOF
+PROFILE=$profile
+MODEL=$model
+LABEL=$label
+THINKING=$thinking
+PID=$pid
+STARTED=$(date +%s)
+EOF
+
+  _wait_for_ready
+}
+
+# ── Commands ─────────────────────────────────────────────────
+
+cmd_start() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: mlx <profile>"
+    echo "Run 'mlx profiles' for options."
+    exit 1
+  fi
+  _start "$1"
+}
+
+cmd_swap() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: mlx swap <profile>"
+    exit 1
+  fi
+  _start "$1"
+}
+
+cmd_stop() {
+  _stop
+  echo "Server stopped."
+}
+
+cmd_status() {
+  if ! _is_running; then
+    echo "Server is not running."
+    return
+  fi
+
+  if [[ -f "$STATEFILE" ]]; then
+    source "$STATEFILE"
+    local now
+    now=$(date +%s)
+    local uptime=$(( now - STARTED ))
+    local mins=$(( uptime / 60 ))
+    local secs=$(( uptime % 60 ))
+    echo "$LABEL | thinking: $THINKING | port $PORT | PID $PID | up ${mins}m${secs}s"
+  else
+    local pid
+    pid=$(cat "$PIDFILE")
+    echo "Server running (PID $pid) — no state file found."
+  fi
+}
+
+cmd_log() {
+  if [[ -f "$LOG" ]]; then
+    tail -f "$LOG"
+  else
+    echo "No log file at $LOG"
+  fi
+}
+
+cmd_profiles() {
+  cat <<'EOF'
+Available profiles:
+
+  27b             Qwen 3.5 27B dense 4-bit, thinking ON
+  27b-nothink     Qwen 3.5 27B dense 4-bit, thinking OFF
+  35b             Qwen 3.5 35B-A3B 4-bit, thinking ON
+  35b-nothink     Qwen 3.5 35B-A3B 4-bit, thinking OFF
+  35b-8bit        Qwen 3.5 35B-A3B 8-bit, thinking ON
+  35b-8bit-nothink  Qwen 3.5 35B-A3B 8-bit, thinking OFF
+EOF
+}
+
+cmd_help() {
+  cat <<'EOF'
+mlx — manage the vllm-mlx server for Goose
+
+Usage:
+  mlx <profile>         Start server with profile (kills existing)
+  mlx swap <profile>    Same as above (explicit restart)
+  mlx status            Show what's running
+  mlx stop              Stop the server
+  mlx log               Tail the server log
+  mlx profiles          List available profiles
+  mlx help              Show this help
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────
+
+case "${1:-help}" in
+  swap)     shift; cmd_swap "$@" ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  log)      cmd_log ;;
+  profiles) cmd_profiles ;;
+  help|-h|--help) cmd_help ;;
+  *)        cmd_start "$1" ;;
+esac
