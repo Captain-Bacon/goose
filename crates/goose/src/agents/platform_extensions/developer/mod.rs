@@ -104,7 +104,7 @@ impl DeveloperClient {
                 title: Some("Read".to_string()),
                 read_only_hint: Some(true),
                 destructive_hint: Some(false),
-                idempotent_hint: Some(true),
+                idempotent_hint: Some(false),
                 open_world_hint: Some(false),
             }),
             Tool::new(
