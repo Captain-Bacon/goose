@@ -98,25 +98,6 @@ impl MlxLifecycle {
         Ok(())
     }
 
-    async fn stop_server(&self) {
-        tracing::info!("Stopping MLX server (idle timeout)");
-        let result = tokio::process::Command::new(&self.mlx_script)
-            .arg("stop")
-            .output()
-            .await;
-        match result {
-            Ok(output) if output.status.success() => {
-                tracing::info!("MLX server stopped");
-            }
-            Ok(output) => {
-                tracing::warn!("mlx stop exited with {}", output.status);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to run mlx stop: {}", e);
-            }
-        }
-    }
-
     fn is_idle(&self) -> bool {
         self.last_request.elapsed() >= self.idle_timeout
     }
@@ -191,9 +172,29 @@ impl MlxProvider {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                let lc = lc.lock().await;
-                if lc.is_idle() && lc.is_server_up().await {
-                    lc.stop_server().await;
+                // Check idle under lock (cheap), then release before network calls
+                let (idle, script, port) = {
+                    let lc = lc.lock().await;
+                    (lc.is_idle(), lc.mlx_script.clone(), lc.port)
+                };
+                if idle {
+                    let url = format!("http://localhost:{}/v1/models", port);
+                    let up = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(2))
+                        .build()
+                        .map(|c| c.get(&url).send())
+                        .ok();
+                    let is_up = match up {
+                        Some(fut) => fut.await.is_ok(),
+                        None => false,
+                    };
+                    if is_up {
+                        tracing::info!("Stopping MLX server (idle timeout)");
+                        let _ = tokio::process::Command::new(&script)
+                            .arg("stop")
+                            .output()
+                            .await;
+                    }
                 }
             }
         });
