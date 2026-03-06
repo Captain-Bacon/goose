@@ -16,8 +16,12 @@ use futures::TryStreamExt;
 use reqwest::Response;
 use rmcp::model::Tool;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::pin;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
@@ -34,6 +38,89 @@ pub const MLX_KNOWN_MODELS: &[&str] = &[
     "mlx-community/Qwen3.5-35B-A3B-8bit",
 ];
 pub const MLX_DOC_URL: &str = "https://github.com/vllm-project/vllm-mlx";
+pub const MLX_DEFAULT_PROFILE: &str = "35b";
+pub const MLX_DEFAULT_IDLE_TIMEOUT: u64 = 15;
+
+struct MlxLifecycle {
+    last_request: Instant,
+    mlx_script: PathBuf,
+    profile: String,
+    port: u16,
+    idle_timeout: Duration,
+}
+
+impl MlxLifecycle {
+    async fn ensure_server_running(&mut self) -> Result<(), ProviderError> {
+        self.last_request = Instant::now();
+
+        if self.is_server_up().await {
+            return Ok(());
+        }
+
+        tracing::info!("MLX server not running, starting with profile '{}'", self.profile);
+        self.start_server().await
+    }
+
+    async fn is_server_up(&self) -> bool {
+        let url = format!("http://localhost:{}/v1/models", self.port);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build();
+        match client {
+            Ok(c) => c.get(&url).send().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    async fn start_server(&self) -> Result<(), ProviderError> {
+        let output = tokio::process::Command::new(&self.mlx_script)
+            .arg(&self.profile)
+            .output()
+            .await
+            .map_err(|e| {
+                ProviderError::RequestFailed(format!(
+                    "Failed to run mlx script at {}: {}",
+                    self.mlx_script.display(),
+                    e
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ProviderError::RequestFailed(format!(
+                "mlx script failed (exit {}): {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+
+        tracing::info!("MLX server started with profile '{}'", self.profile);
+        Ok(())
+    }
+
+    async fn stop_server(&self) {
+        tracing::info!("Stopping MLX server (idle timeout)");
+        let result = tokio::process::Command::new(&self.mlx_script)
+            .arg("stop")
+            .output()
+            .await;
+        match result {
+            Ok(output) if output.status.success() => {
+                tracing::info!("MLX server stopped");
+            }
+            Ok(output) => {
+                tracing::warn!("mlx stop exited with {}", output.status);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to run mlx stop: {}", e);
+            }
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.last_request.elapsed() >= self.idle_timeout
+    }
+}
 
 #[derive(serde::Serialize)]
 pub struct MlxProvider {
@@ -41,6 +128,8 @@ pub struct MlxProvider {
     api_client: ApiClient,
     model: ModelConfig,
     name: String,
+    #[serde(skip)]
+    lifecycle: Arc<Mutex<MlxLifecycle>>,
 }
 
 impl MlxProvider {
@@ -57,6 +146,26 @@ impl MlxProvider {
         let timeout: Duration =
             Duration::from_secs(config.get_param("MLX_TIMEOUT").unwrap_or(MLX_TIMEOUT));
 
+        let profile: String = config
+            .get_param("MLX_PROFILE")
+            .unwrap_or_else(|_| MLX_DEFAULT_PROFILE.to_string());
+
+        let idle_minutes: u64 = config
+            .get_param("MLX_IDLE_TIMEOUT")
+            .unwrap_or(MLX_DEFAULT_IDLE_TIMEOUT);
+
+        let mlx_script: PathBuf = config
+            .get_param::<String>("MLX_SCRIPT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                // crates/goose -> repo root
+                p.pop();
+                p.pop();
+                p.push("mlx");
+                p
+            });
+
         let base = if host.starts_with("http://") || host.starts_with("https://") {
             host.clone()
         } else {
@@ -69,10 +178,31 @@ impl MlxProvider {
         let api_client =
             ApiClient::with_timeout(base_url.to_string(), AuthMethod::NoAuth, timeout)?;
 
+        let lifecycle = Arc::new(Mutex::new(MlxLifecycle {
+            last_request: Instant::now(),
+            mlx_script,
+            profile,
+            port,
+            idle_timeout: Duration::from_secs(idle_minutes * 60),
+        }));
+
+        // Spawn idle watcher
+        let lc = Arc::clone(&lifecycle);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let lc = lc.lock().await;
+                if lc.is_idle() && lc.is_server_up().await {
+                    lc.stop_server().await;
+                }
+            }
+        });
+
         Ok(Self {
             api_client,
             model,
             name: MLX_PROVIDER_NAME.to_string(),
+            lifecycle,
         })
     }
 }
@@ -102,6 +232,20 @@ impl ProviderDef for MlxProvider {
                     false,
                     false,
                     Some(&MLX_TIMEOUT.to_string()),
+                    false,
+                ),
+                ConfigKey::new(
+                    "MLX_PROFILE",
+                    false,
+                    false,
+                    Some(MLX_DEFAULT_PROFILE),
+                    false,
+                ),
+                ConfigKey::new(
+                    "MLX_IDLE_TIMEOUT",
+                    false,
+                    false,
+                    Some("15"),
                     false,
                 ),
             ],
@@ -134,6 +278,12 @@ impl Provider for MlxProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        // Ensure server is running before making the request
+        {
+            let mut lc = self.lifecycle.lock().await;
+            lc.ensure_server_running().await?;
+        }
+
         let config = crate::config::Config::global();
         let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
         let filtered_tools = if goose_mode == GooseMode::Chat {
@@ -168,6 +318,12 @@ impl Provider for MlxProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        // Also ensure server is running for model listing
+        {
+            let mut lc = self.lifecycle.lock().await;
+            lc.ensure_server_running().await?;
+        }
+
         let response = self
             .api_client
             .request(None, "v1/models")
