@@ -15,7 +15,6 @@ use futures::future::BoxFuture;
 use futures::TryStreamExt;
 use reqwest::Response;
 use rmcp::model::Tool;
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,27 +37,45 @@ pub const MLX_KNOWN_MODELS: &[&str] = &[
     "mlx-community/Qwen3.5-35B-A3B-8bit",
 ];
 pub const MLX_DOC_URL: &str = "https://github.com/vllm-project/vllm-mlx";
-pub const MLX_DEFAULT_PROFILE: &str = "35b";
 pub const MLX_DEFAULT_IDLE_TIMEOUT: u64 = 15;
+
+fn model_to_profile(model_name: &str) -> &str {
+    match model_name {
+        "mlx-community/Qwen3.5-27B-4bit" => "27b",
+        "mlx-community/Qwen3.5-35B-A3B-8bit" => "35b-8bit",
+        _ => "35b",
+    }
+}
 
 struct MlxLifecycle {
     last_request: Instant,
     mlx_script: PathBuf,
-    profile: String,
+    active_profile: Option<String>,
     port: u16,
     idle_timeout: Duration,
 }
 
 impl MlxLifecycle {
-    async fn ensure_server_running(&mut self) -> Result<(), ProviderError> {
+    async fn ensure_server_running(&mut self, model_name: &str) -> Result<(), ProviderError> {
         self.last_request = Instant::now();
+        let needed_profile = model_to_profile(model_name).to_string();
 
         if self.is_server_up().await {
-            return Ok(());
+            // Server is running — check if it's the right profile
+            if self.active_profile.as_deref() == Some(&needed_profile) {
+                return Ok(());
+            }
+            // Wrong model loaded, restart with the right one
+            tracing::info!(
+                "MLX server running with wrong profile (have {:?}, need '{}'), restarting",
+                self.active_profile, needed_profile
+            );
         }
 
-        tracing::info!("MLX server not running, starting with profile '{}'", self.profile);
-        self.start_server().await
+        tracing::info!("Starting MLX server with profile '{}'", needed_profile);
+        self.start_server(&needed_profile).await?;
+        self.active_profile = Some(needed_profile);
+        Ok(())
     }
 
     async fn is_server_up(&self) -> bool {
@@ -72,9 +89,9 @@ impl MlxLifecycle {
         }
     }
 
-    async fn start_server(&self) -> Result<(), ProviderError> {
+    async fn start_server(&self, profile: &str) -> Result<(), ProviderError> {
         let output = tokio::process::Command::new(&self.mlx_script)
-            .arg(&self.profile)
+            .arg(profile)
             .output()
             .await
             .map_err(|e| {
@@ -94,7 +111,7 @@ impl MlxLifecycle {
             )));
         }
 
-        tracing::info!("MLX server started with profile '{}'", self.profile);
+        tracing::info!("MLX server started with profile '{}'", profile);
         Ok(())
     }
 
@@ -127,10 +144,6 @@ impl MlxProvider {
         let timeout: Duration =
             Duration::from_secs(config.get_param("MLX_TIMEOUT").unwrap_or(MLX_TIMEOUT));
 
-        let profile: String = config
-            .get_param("MLX_PROFILE")
-            .unwrap_or_else(|_| MLX_DEFAULT_PROFILE.to_string());
-
         let idle_minutes: u64 = config
             .get_param("MLX_IDLE_TIMEOUT")
             .unwrap_or(MLX_DEFAULT_IDLE_TIMEOUT);
@@ -162,7 +175,7 @@ impl MlxProvider {
         let lifecycle = Arc::new(Mutex::new(MlxLifecycle {
             last_request: Instant::now(),
             mlx_script,
-            profile,
+            active_profile: None,
             port,
             idle_timeout: Duration::from_secs(idle_minutes * 60),
         }));
@@ -194,6 +207,9 @@ impl MlxProvider {
                             .arg("stop")
                             .output()
                             .await;
+                        // Clear active profile so next request triggers a fresh start
+                        let mut lc = lc.lock().await;
+                        lc.active_profile = None;
                     }
                 }
             }
@@ -236,13 +252,6 @@ impl ProviderDef for MlxProvider {
                     false,
                 ),
                 ConfigKey::new(
-                    "MLX_PROFILE",
-                    false,
-                    false,
-                    Some(MLX_DEFAULT_PROFILE),
-                    false,
-                ),
-                ConfigKey::new(
                     "MLX_IDLE_TIMEOUT",
                     false,
                     false,
@@ -279,10 +288,10 @@ impl Provider for MlxProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        // Ensure server is running before making the request
+        // Ensure server is running with the right model before making the request
         {
             let mut lc = self.lifecycle.lock().await;
-            lc.ensure_server_running().await?;
+            lc.ensure_server_running(&model_config.model_name).await?;
         }
 
         let config = crate::config::Config::global();
@@ -319,44 +328,8 @@ impl Provider for MlxProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
-        // Also ensure server is running for model listing
-        {
-            let mut lc = self.lifecycle.lock().await;
-            lc.ensure_server_running().await?;
-        }
-
-        let response = self
-            .api_client
-            .request(None, "v1/models")
-            .response_get()
-            .await
-            .map_err(|e| ProviderError::RequestFailed(format!("Failed to fetch models: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(ProviderError::RequestFailed(format!(
-                "Failed to fetch models: HTTP {}",
-                response.status()
-            )));
-        }
-
-        let json_response = response.json::<Value>().await.map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to parse response: {}", e))
-        })?;
-
-        let models = json_response
-            .get("data")
-            .and_then(|m| m.as_array())
-            .ok_or_else(|| {
-                ProviderError::RequestFailed("No data array in response".to_string())
-            })?;
-
-        let mut model_names: Vec<String> = models
-            .iter()
-            .filter_map(|model| model.get("id").and_then(|n| n.as_str()).map(String::from))
-            .collect();
-
-        model_names.sort();
-        Ok(model_names)
+        // Return known models — no need to start the server just to list models
+        Ok(MLX_KNOWN_MODELS.iter().map(|s| s.to_string()).collect())
     }
 }
 
