@@ -220,7 +220,7 @@ impl ProviderDef for MlxProvider {
             MLX_KNOWN_MODELS.to_vec(),
             MLX_DOC_URL,
             vec![
-                ConfigKey::new("MLX_HOST", false, false, Some(MLX_HOST), false),
+                ConfigKey::new("MLX_HOST", true, false, Some(MLX_HOST), false),
                 ConfigKey::new(
                     "MLX_PORT",
                     false,
